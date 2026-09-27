@@ -607,6 +607,57 @@ def route_issuance(
     return {"assigned": max_total, "results": results, "usage": usage}
 
 
+def check_csr(
+    names: list[dict],
+    ca: str,
+    records: list[dict],
+) -> dict:
+    """Authorize every SAN identifier of a CSR against one record snapshot.
+
+    ``names`` carries one ``{"name", "domain", "wildcard"}`` entry per
+    SAN DNSName, in SAN order (``name`` keeps the ``*.`` wildcard marker,
+    ``domain`` is the name the CAA lookup actually runs). The record set
+    is prepared once and shared by every lookup, and each identifier is
+    evaluated with the same rules as :func:`evaluate`; any name/record/
+    alias failure surfaces as a 422-grade :class:`CAAError`. The whole
+    CSR is acceptable only when *every* identifier is authorized.
+    """
+    ca_name = normalize_name(ca, field="ca")
+
+    # One record set for the whole CSR: a single evaluator prepares it on
+    # first use and every SAN identifier reuses the same snapshot.
+    authorize = _evaluator_for(records)
+
+    identifiers: list[dict] = []
+    for entry in names:
+        verdict = authorize(entry["domain"], entry["wildcard"], ca_name)
+        identifiers.append(
+            {
+                "name": entry["name"],
+                "wildcard": entry["wildcard"],
+                "domain": entry["domain"],
+                "authorized": verdict["authorized"],
+                "effective_owner": verdict["effective_owner"],
+                "reason": verdict["reason"],
+                "trace": verdict["trace"],
+            }
+        )
+
+    authorized = all(item["authorized"] for item in identifiers)
+    if authorized:
+        reason = (
+            f"all {len(identifiers)} SAN identifier(s) authorized for CA "
+            f"{ca_name}"
+        )
+    else:
+        failed = [item["name"] for item in identifiers if not item["authorized"]]
+        reason = (
+            f"{len(failed)} of {len(identifiers)} SAN identifier(s) not "
+            f"authorized for CA {ca_name}: {failed}; CSR not acceptable"
+        )
+    return {"authorized": authorized, "reason": reason, "identifiers": identifiers}
+
+
 def plan_patch(
     domain: str,
     wildcard: bool,

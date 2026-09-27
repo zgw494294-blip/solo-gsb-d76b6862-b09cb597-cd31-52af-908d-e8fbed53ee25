@@ -375,6 +375,58 @@ class IssuanceRouteResponse(BaseModel):
     usage: list[CAUsage]
 
 
+class CheckCSRRequest(BaseModel):
+    """A PEM PKCS#10 CSR to verify and authorize against the record set."""
+
+    csr: str = Field(
+        ...,
+        min_length=1,
+        description="PEM-encoded PKCS#10 CSR; at most 64 KiB (65536 UTF-8 bytes)",
+    )
+    ca: str = Field(..., description="Issuing CA domain name")
+    records: list[Record] = Field(
+        default_factory=list,
+        max_length=100,
+        description="Up to 100 CAA/CNAME records used as the offline DNS view",
+    )
+
+    @field_validator("ca")
+    @classmethod
+    def _norm_ca(cls, v: str) -> str:
+        return normalize_name(v, field="ca")
+
+
+class CSRIdentifierResult(BaseModel):
+    """Authorization outcome for one SAN DNS name, in SAN input order."""
+
+    name: str = Field(
+        ..., description="Normalized SAN DNS name ('*.name' for a wildcard)"
+    )
+    wildcard: bool = Field(
+        ..., description="Whether the SAN name is a leftmost '*.name' wildcard"
+    )
+    domain: str = Field(
+        ..., description="Name actually queried against CAA ('*.' stripped)"
+    )
+    authorized: bool
+    effective_owner: Optional[str]
+    reason: str
+    trace: list[TraceStepOut]
+
+
+class CheckCSRResponse(BaseModel):
+    csr_sha256: str = Field(
+        ..., description="SHA-256 of the CSR DER encoding, lowercase hex"
+    )
+    authorized: bool = Field(
+        ..., description="True only when every SAN identifier is authorized"
+    )
+    reason: str
+    identifiers: list[CSRIdentifierResult] = Field(
+        ..., description="Per-identifier results in SAN input order"
+    )
+
+
 class ImportZoneRequest(BaseModel):
     """BIND zone text to import under an absolute origin."""
 

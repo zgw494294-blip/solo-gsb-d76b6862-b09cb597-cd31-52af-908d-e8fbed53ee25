@@ -1,16 +1,18 @@
 """FastAPI application exposing POST /v1/authorize, /v1/authorize/patch-plan,
 /v1/authorize/change-impact, /v1/authorize/rollout-window,
-/v1/issuance/route, /v1/records/import-zone, /v1/records/export-zone and
-/v1/records/minimize."""
+/v1/issuance/route, /v1/issuance/check-csr, /v1/records/import-zone,
+/v1/records/export-zone and /v1/records/minimize."""
 
 from __future__ import annotations
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from .csr import MAX_CSR_BYTES, CSRError, inspect_csr
 from .engine import (
     CAAError,
     change_impact,
+    check_csr,
     evaluate,
     minimize_records,
     plan_patch,
@@ -22,6 +24,8 @@ from .schemas import (
     AuthorizeResponse,
     ChangeImpactRequest,
     ChangeImpactResponse,
+    CheckCSRRequest,
+    CheckCSRResponse,
     ExportZoneRequest,
     ExportZoneResponse,
     ImportZoneRequest,
@@ -50,8 +54,9 @@ app = FastAPI(
 @app.exception_handler(CAAError)
 async def caa_error_handler(_: Request, exc: CAAError) -> JSONResponse:
     # All engine-level failures (bad names, mixed RRs, multiple CNAMEs,
-    # alias loops, >8 hops) and zone-import failures are client errors and
-    # map to HTTP 422. Zone-import errors additionally carry the source line.
+    # alias loops, >8 hops), CSR parse/signature/SAN failures and
+    # zone-import failures are client errors and map to HTTP 422.
+    # Zone-import errors additionally carry the source line.
     content: dict = {"detail": str(exc), "error_type": exc.__class__.__name__}
     line = getattr(exc, "line", None)
     if line is not None:
@@ -150,6 +155,27 @@ async def issuance_route(payload: IssuanceRouteRequest) -> IssuanceRouteResponse
         records=[r.model_dump() for r in payload.records],
     )
     return IssuanceRouteResponse(**result)
+
+
+@app.post(
+    "/v1/issuance/check-csr",
+    response_model=CheckCSRResponse,
+    tags=["caa"],
+    summary="Verify a CSR and authorize every SAN DNS name",
+)
+async def issuance_check_csr(payload: CheckCSRRequest) -> CheckCSRResponse:
+    if len(payload.csr.encode("utf-8")) > MAX_CSR_BYTES:
+        raise CSRError("CSR exceeds 64 KiB (65536 bytes)")
+    info = inspect_csr(payload.csr)
+    result = check_csr(
+        names=[
+            {"name": n.name, "domain": n.domain, "wildcard": n.wildcard}
+            for n in info.names
+        ],
+        ca=payload.ca,
+        records=[r.model_dump() for r in payload.records],
+    )
+    return CheckCSRResponse(csr_sha256=info.sha256, **result)
 
 
 @app.post(

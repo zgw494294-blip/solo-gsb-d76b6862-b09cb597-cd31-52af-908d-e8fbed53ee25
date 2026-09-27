@@ -5,6 +5,9 @@
 从域名逐级上溯、跟随 CNAME 别名，找到首个生效 CAA 集后给出「允许 / 拒绝签发」结论与完整查找轨迹。
 `POST /v1/issuance/route` 可一次提交多个签发请求与多个 CA 的容量，先逐对判定授权，再在容量约束下
 完成「最大化分配数 + 字典序最优」的 CA 分配。
+`POST /v1/issuance/check-csr` 接收一份不超过 64 KiB 的 PEM PKCS#10 CSR：用 `cryptography` 校验
+CSR 签名后，**仅从 subjectAltName 提取 1～20 个 dNSName**（缺失 SAN 或含其他标识均拒绝，绝不以
+CN 兜底），按 SAN 顺序逐个套用同一套 CAA 判定并共享一次记录准备，任一标识未获授权则整份 CSR 不可受理。
 `POST /v1/authorize/change-impact` 可提交一批删除 / 新增编辑，审查它们会翻转哪些查询的签发许可，
 并为每个翻转给出可重现新版判定的最小编辑子集。
 `POST /v1/records/minimize` 则只删不增：在保持所有提交查询的 `authorized` 与 `effective_owner`
@@ -404,6 +407,122 @@ curl -s -X POST http://localhost:8080/v1/issuance/route \
 若只是容量不足（含所有获授权 CA 容量为 0），`reason` 为
 `"insufficient capacity for every authorized candidate"`。
 
+### `POST /v1/issuance/check-csr`
+
+CSR 受理前检查：接收一份不超过 **64 KiB** 的 **PEM 编码 PKCS#10 CSR**、签发 CA 域名与离线
+DNS 记录集，先用 `cryptography` 校验 CSR 自身签名，再**只从 subjectAltName 扩展**提取标识，
+按 SAN 顺序逐个执行 `/v1/authorize` 的完整判定。记录集在整份 CSR 的全部标识间**只准备一次**。
+
+请求体：
+
+| 字段      | 类型            | 必填 | 说明                                                         |
+| --------- | --------------- | ---- | ------------------------------------------------------------ |
+| `csr`     | string          | 是   | PEM PKCS#10 CSR 文本，不超过 64 KiB（65536 字节）            |
+| `ca`      | string          | 是   | 签发 CA 的域名（忽略大小写与尾点）                           |
+| `records` | array ≤ 100 条  | 否   | 离线 DNS 记录集（与 `/v1/authorize` 相同的 CAA / CNAME 记录）     |
+
+CSR / SAN 规则（任一不满足均返回 **422**，`error_type=CSRError`）：
+
+1. **PEM 解析与签名**：PEM 无法解析、签名无法用 CSR 内嵌公钥验证（包括签名被篡改）均拒绝。
+2. **只认 SAN，不以 CN 兜底**：CSR 必须携带 subjectAltName 扩展；subject CN 即使存在也完全忽略。
+3. **仅接受 dNSName**：SAN 中的每个 GeneralName 都必须是 DNSName，出现 IP / URI / email 等
+   其他标识即拒绝。
+4. **1～20 个**：DNSName 数量必须在 1～20 之间（空 SAN、超过 20 个均拒绝）。
+5. **名称规范化**：忽略大小写与**单个**尾点；规范化后重名（如 `Example.com` 与 `example.com.`）
+   拒绝。`*.example.com` 与 `example.com` 是两个不同标识（前者保留 `*.` 标记，不算重名）。
+6. **通配符**：只允许最左侧的 `*.` 标签（`*.example.com`）；判定时去掉 `*.`、以
+   `domain=example.com`、`wildcard=true` 查询（因此走 `issuewild` 规则）。
+   `*example.com`、`a.*.example.com`、`*.*.example.com` 等任何其他形态均拒绝；空标签、
+   非法字符、以 `-` 开头 / 结尾等沿用 `/v1/authorize` 的名称规则同样拒绝。
+
+判定与整体结果：
+
+1. 按 **SAN 中的顺序**，对每个标识执行与 `/v1/authorize` 完全相同的逐级上溯、CNAME 跟随与
+   CAA 标签规则；全部标识共用**一次** `prepare_records` 记录准备。
+2. **任一标识未获授权，整份 CSR 不可受理**（整体 `authorized=false`），但响应仍给出**每个**
+   标识各自的授权结果，不提前短路。
+3. 判定过程中触发的别名错误（CNAME 成环、累计超 8 跳）及记录集错误（同名混用、多条 CNAME、
+   flag 非法等）同样返回 **422**。
+
+响应体：
+
+| 字段                                | 说明                                                                |
+| ----------------------------------- | ------------------------------------------------------------------- |
+| `csr_sha256`                        | CSR **DER 编码**的 SHA-256（小写十六进制），可用于幂等 / 去重       |
+| `authorized`                        | 整体结果：所有 SAN 标识均获授权才为 `true`                          |
+| `reason`                            | 人读整体结论（含未授权标识列表）                                    |
+| `identifiers`                       | 各标识结果，按 **SAN 输入顺序**                                     |
+| `identifiers[].name`                | 规范化后的 SAN 名称（通配符保留 `*.`）                              |
+| `identifiers[].wildcard`            | 是否为最左侧 `*.` 通配符标识                                        |
+| `identifiers[].domain`              | 实际参与 CAA 查询的名称（已去掉 `*.`）                              |
+| `identifiers[].authorized`          | 该标识是否获授权                                                    |
+| `identifiers[].effective_owner`     | 该标识查找命中的生效 CAA owner（无则 `null`）                       |
+| `identifiers[].reason` / `.trace`   | 该标识的判定理由与完整逐级 / 逐跳轨迹（结构同 `/v1/authorize`）     |
+
+先用 openssl 生成一份带两个 SAN 的 CSR，再调用接口（`jq` 把 PEM 文本原样放入 `csr` 字段）：
+
+```bash
+openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+  -keyout /tmp/csr.key -out /tmp/csr.pem \
+  -subj "/CN=www.example.com" \
+  -addext "subjectAltName=DNS:www.example.com,DNS:*.example.com"
+
+jq -n --rawfile csr /tmp/csr.pem \
+  '{csr:$csr, ca:"letsencrypt.org", records:[
+      {"type":"CAA","owner":"example.com","flag":0,"tag":"issue","value":"letsencrypt.org"},
+      {"type":"CAA","owner":"example.com","flag":0,"tag":"issuewild","value":"letsencrypt.org"}
+    ]}' \
+  | curl -s -X POST http://localhost:8080/v1/issuance/check-csr \
+      -H 'Content-Type: application/json' -d @-
+```
+
+```json
+{
+  "csr_sha256": "236ec4df11971a811c926b805f48cd36d8377603d3b6897e857b767c6e7c2f3c",
+  "authorized": true,
+  "reason": "all 2 SAN identifier(s) authorized for CA letsencrypt.org",
+  "identifiers": [
+    {
+      "name": "www.example.com",
+      "wildcard": false,
+      "domain": "www.example.com",
+      "authorized": true,
+      "effective_owner": "example.com",
+      "reason": "issue property at example.com authorizes CA letsencrypt.org",
+      "trace": [
+        {"query": "www.example.com", "kind": "caa", "cname_target": null, "cname_hops": 0, "caa": null},
+        {"query": "example.com", "kind": "caa", "cname_target": null, "cname_hops": 0,
+         "caa": [
+           {"flag": 0, "tag": "issue", "value": "letsencrypt.org"},
+           {"flag": 0, "tag": "issuewild", "value": "letsencrypt.org"}
+         ]}
+      ]
+    },
+    {
+      "name": "*.example.com",
+      "wildcard": true,
+      "domain": "example.com",
+      "authorized": true,
+      "effective_owner": "example.com",
+      "reason": "issuewild property at example.com authorizes CA letsencrypt.org",
+      "trace": [
+        {"query": "example.com", "kind": "caa", "cname_target": null, "cname_hops": 0,
+         "caa": [
+           {"flag": 0, "tag": "issue", "value": "letsencrypt.org"},
+           {"flag": 0, "tag": "issuewild", "value": "letsencrypt.org"}
+         ]}
+      ]
+    }
+  ]
+}
+```
+
+> `csr_sha256` 由所提交 CSR 的 DER 决定，重新生成 CSR 后该值会变化；上面的值对应示例输出中的 CSR。
+
+错误请求示例：篡改 CSR 签名 → HTTP 422，`{"detail":"CSR signature is invalid","error_type":"CSRError"}`；
+SAN 含 IP 地址、缺少 SAN（只有 CN）、DNSName 超 20 个、名称非法或规范化后重名同样返回 422；
+任一标识查找时命中 CNAME 成环则返回 `error_type=CNAMELoopError`。
+
 ### `POST /v1/records/import-zone`
 
 把一段 BIND zone 文本解析成**可直接作为 `/v1/authorize` 的 `records` 使用**的 CAA/CNAME
@@ -657,10 +776,12 @@ curl -s -X POST http://localhost:8080/v1/records/minimize \
   `evaluate_prepared(domain, wildcard, ca, prepare_records(records))`，
   供 `/v1/authorize` 等单查询入口使用。
 
-批量操作（`/v1/issuance/route` 容量分配、`/v1/authorize/patch-plan` 补丁规划、
+批量操作（`/v1/issuance/route` 容量分配、`/v1/issuance/check-csr` 全 CSR 标识判定、
+`/v1/authorize/patch-plan` 补丁规划、
 `/v1/authorize/change-impact` 变更影响、`/v1/records/minimize` 记录精简、
 `/v1/authorize/rollout-window` 灰度窗口）在单次操作中对每个基线、新版或候选记录组
-**至多准备一次**，该组的全部查询复用同一快照；搜索再次访问同一记录组时
+**至多准备一次**，该组的全部查询复用同一快照（check-csr 即一份记录集服务全部 1～20 个 SAN 标识）；
+搜索再次访问同一记录组时
 （如 change-impact 枚举到完整编辑子集、minimize 枚举到全量子序列、rollout-window
 枚举到全旧 / 全新组合）也直接复用已准备的快照，不再重复规范化与校验；搜索过程中的
 无效候选（同名混用、多条 CNAME、成环、超 8 跳、超 100 条）仍按原规则跳过。
@@ -766,11 +887,13 @@ app/
   __init__.py
   engine.py     # 记录准备（prepare_records → 不可变索引）与查询判定（evaluate_prepared）分离；
               # 规范化、逐级上溯、CNAME 链、判定规则（纯逻辑，无 I/O）
+  csr.py        # PKCS#10 CSR 解析、签名校验与 SAN DNSName 提取（cryptography）
   zonefile.py   # BIND zone 文本解析与导出（$ORIGIN/$TTL、owner 继承、括号/引号/转义）
   schemas.py    # Pydantic v2 请求/响应模型与输入校验
   main.py       # FastAPI 路由与 422 异常映射
 tests/
   test_api.py             # 48 条 authorize / patch-plan 端到端用例
+  test_check_csr.py       # 41 条 CSR 受理检查（check-csr）用例
   test_change_impact.py   # 28 条变更影响审查（change-impact）用例
   test_export_zone.py     # 26 条 zone 导出（export-zone）用例
   test_issuance_route.py  # 24 条批量签发路由用例（pytest + TestClient）
