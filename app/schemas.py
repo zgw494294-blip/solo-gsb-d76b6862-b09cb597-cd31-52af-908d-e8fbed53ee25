@@ -375,6 +375,82 @@ class IssuanceRouteResponse(BaseModel):
     usage: list[CAUsage]
 
 
+class CheckCSRRequest(BaseModel):
+    """A PEM PKCS#10 CSR to authorize identifier-by-identifier."""
+
+    csr: str = Field(
+        ...,
+        min_length=1,
+        description="PEM-encoded PKCS#10 CSR; at most 64 KiB (65536 UTF-8 bytes)",
+    )
+    ca: str = Field(..., description="Issuing CA domain name")
+    records: list[Record] = Field(
+        default_factory=list,
+        max_length=100,
+        description="Up to 100 CAA/CNAME records used as the offline DNS view",
+    )
+
+    @field_validator("ca")
+    @classmethod
+    def _norm_ca(cls, v: str) -> str:
+        return normalize_name(v, field="ca")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "csr": (
+                        "-----BEGIN CERTIFICATE REQUEST-----\n"
+                        "MIIBDzCBtgIBADAaMRgwFgYDVQQDDA93d3cuZXhhbXBsZS5jb20wWTATBgcqhkjO\n"
+                        "PQIBBggqhkjOPQMBBwNCAATwZFWO2k1hyFNPh2Y6KAMfWDixDPff/34H2w3ISrhw\n"
+                        "t5mmI5bRzQpkYvdnhz8NG/IKdXn7LRNbU9pRGND3U2mdoDowOAYJKoZIhvcNAQkO\n"
+                        "MSswKTAnBgNVHREEIDAegg93d3cuZXhhbXBsZS5jb22CC2V4YW1wbGUuY29tMAoG\n"
+                        "CCqGSM49BAMCA0gAMEUCIQD80XAvyhChqhEswA7AqSeeWZ45Y18FX4XETuPtm2EQ\n"
+                        "IQIgCt2bxqxdcirseWAUopZu+SA2QjnywY+8O9FuRjlxgA0=\n"
+                        "-----END CERTIFICATE REQUEST-----\n"
+                    ),
+                    "ca": "letsencrypt.org",
+                    "records": [
+                        {
+                            "type": "CAA",
+                            "owner": "example.com",
+                            "flag": 0,
+                            "tag": "issue",
+                            "value": "letsencrypt.org",
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+
+
+class CSRIdentifierResult(BaseModel):
+    """Authorization outcome for one SAN DNS identifier."""
+
+    name: str = Field(
+        ..., description="Normalized identifier (wildcard prefix removed)"
+    )
+    wildcard: bool = Field(
+        ..., description="Whether the identifier carried a left-most '*.' prefix"
+    )
+    authorized: bool
+    effective_owner: Optional[str]
+    trace: list[TraceStepOut]
+
+
+class CheckCSRResponse(BaseModel):
+    csr_sha256: str = Field(
+        ..., description="SHA-256 hex digest of the CSR DER encoding"
+    )
+    accepted: bool = Field(
+        ..., description="True only when every SAN identifier is authorized"
+    )
+    identifiers: list[CSRIdentifierResult] = Field(
+        ..., description="Per-identifier outcomes, in SAN order"
+    )
+
+
 class ImportZoneRequest(BaseModel):
     """BIND zone text to import under an absolute origin."""
 

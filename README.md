@@ -5,6 +5,10 @@
 从域名逐级上溯、跟随 CNAME 别名，找到首个生效 CAA 集后给出「允许 / 拒绝签发」结论与完整查找轨迹。
 `POST /v1/issuance/route` 可一次提交多个签发请求与多个 CA 的容量，先逐对判定授权，再在容量约束下
 完成「最大化分配数 + 字典序最优」的 CA 分配。
+`POST /v1/issuance/check-csr` 则面向真实证书申领：接收一份 PEM 编码的 PKCS#10 CSR，
+用 `cryptography` 校验其自签名，仅从 SAN 提取 DNS 标识（绝不回退 CN），按 SAN 顺序对每个标识
+复用同一套 CAA 规则判定授权，任一标识未获授权则整份 CSR 不可受理，并返回 CSR DER 的 SHA-256、
+整体结论与每个标识的判定轨迹。
 `POST /v1/authorize/change-impact` 可提交一批删除 / 新增编辑，审查它们会翻转哪些查询的签发许可，
 并为每个翻转给出可重现新版判定的最小编辑子集。
 `POST /v1/records/minimize` 则只删不增：在保持所有提交查询的 `authorized` 与 `effective_owner`
@@ -404,6 +408,106 @@ curl -s -X POST http://localhost:8080/v1/issuance/route \
 若只是容量不足（含所有获授权 CA 容量为 0），`reason` 为
 `"insufficient capacity for every authorized candidate"`。
 
+### `POST /v1/issuance/check-csr`
+
+CSR 受理检查：接收一份 **PEM 编码的 PKCS#10 CSR**，验证其自签名后，**仅从 SAN（subjectAltName）
+提取 DNS 标识**，按 SAN 顺序对每个标识套用 `/v1/authorize` 的全部判定规则；任一标识未获授权，
+整份 CSR 即不可受理。
+
+请求体：
+
+| 字段      | 类型           | 必填 | 说明                                                         |
+| --------- | -------------- | ---- | ------------------------------------------------------------ |
+| `csr`     | string         | 是   | PEM 编码的 PKCS#10 CSR，不超过 64 KiB（65536 UTF-8 字节）     |
+| `ca`      | string         | 是   | 签发 CA 的域名（忽略大小写与尾点）                           |
+| `records` | array ≤ 100 条 | 否   | 离线 DNS 记录集（与 `/v1/authorize` 相同的 CAA / CNAME 记录） |
+
+受理规则：
+
+1. **签名验证**：用 `cryptography` 解析 PEM 并校验 CSR 自签名；无法解析或签名无效均返回 **422**
+   （`error_type=CSRError`）。CSR 超过 64 KiB 同样 422。
+2. **仅取 SAN 的 DNSName**：CSR 必须携带 SAN 扩展，且其中每个 GeneralName 都必须是 DNSName——
+   缺失 SAN、混入 IP 地址 / 邮箱 / URI 等其他标识均返回 422；**绝不以 subject CN 兜底**。
+   DNS 标识须为 **1～20** 个，超出范围返回 422。
+3. **名称规范化**：忽略大小写与单个尾点；通配符只允许最左侧的 `*.`，CAA 查询时去掉 `*.` 并以
+   `wildcard=true` 判定（即适用 `issuewild` 规则）；其他位置的 `*`（如 `foo.*.example.com`、
+   `*foo.example.com`）或任何非法名称（空标签、标签超 63 字符、非法字符等）均返回 422。
+   **规范化后重名**的标识（如 `WWW.Example.com` 与 `www.example.COM.`）返回 422；
+   `*.example.com` 与 `example.com` 是两个不同标识，可共存。
+4. **共享一次记录准备**：整份 CSR 的所有标识共用同一份记录集校验结果（`prepare_records`
+   只执行一次），按 SAN 顺序逐个判定；记录集与别名沿用全部既有规则——同名混用、多条 CNAME、
+   CNAME 成环、累计超 8 跳等仍返回 **422**。
+5. **整体结论**：任一标识 `authorized=false`，`accepted` 即为 `false`（HTTP 仍为 200）；
+   只有全部标识获授权时 `accepted=true`。
+
+响应体：
+
+| 字段                            | 说明                                                       |
+| ------------------------------- | ---------------------------------------------------------- |
+| `csr_sha256`                    | CSR DER 编码的 SHA-256（十六进制），与 `openssl req -outform DER \| sha256sum` 一致 |
+| `accepted`                      | 整份 CSR 是否可受理（全部标识获授权才为 `true`）           |
+| `identifiers`                   | 各标识的判定结果，**按 SAN 顺序**                          |
+| `identifiers[].name`            | 规范化后的标识（已去掉 `*.` 前缀）                         |
+| `identifiers[].wildcard`        | 该标识是否带最左侧 `*.` 前缀                               |
+| `identifiers[].authorized`      | 该标识的授权判定                                           |
+| `identifiers[].effective_owner` | 该标识的生效 CAA owner（全程无 CAA 为 `null`）             |
+| `identifiers[].trace`           | 该标识的逐级 / 逐跳查找轨迹（结构同 `/v1/authorize`）      |
+
+错误（**422**）：CSR 超大 / 无法解析 / 签名无效、缺失 SAN、SAN 含非 DNS 标识、标识数量越界、
+规范化后重名、非法标识名称（`error_type=CSRError` 或 `InvalidNameError`），以及沿用
+`/v1/authorize` 的记录与别名错误（`MixedRecordsError`、`MultipleCNAMEError`、`CNAMELoopError`、
+`CNAMELimitError`）；`ca` 名称非法、记录超过 100 条同样 422。
+
+```bash
+# 1) 生成一份带两个 SAN 名称的 CSR
+openssl req -new -newkey rsa:2048 -nodes -keyout key.pem -out csr.pem \
+  -subj "/CN=www.example.com" \
+  -addext "subjectAltName=DNS:www.example.com,DNS:example.com"
+
+# 2) 用 jq 把 PEM 文本拼进 JSON 请求体后提交
+jq -n --arg csr "$(cat csr.pem)" '{
+  csr: $csr,
+  ca: "letsencrypt.org",
+  records: [
+    {"type":"CAA","owner":"example.com","flag":0,"tag":"issue","value":"letsencrypt.org"}
+  ]
+}' | curl -s -X POST http://localhost:8080/v1/issuance/check-csr \
+  -H 'Content-Type: application/json' -d @-
+```
+
+```json
+{
+  "csr_sha256": "43eec5653524c1b8a7db3089969a98892250208c27dbb886e3303f5e5a86b568",
+  "accepted": true,
+  "identifiers": [
+    {
+      "name": "www.example.com",
+      "wildcard": false,
+      "authorized": true,
+      "effective_owner": "example.com",
+      "trace": [
+        {"query": "www.example.com", "kind": "caa", "cname_target": null, "cname_hops": 0, "caa": null},
+        {"query": "example.com", "kind": "caa", "cname_target": null, "cname_hops": 0,
+         "caa": [{"flag": 0, "tag": "issue", "value": "letsencrypt.org"}]}
+      ]
+    },
+    {
+      "name": "example.com",
+      "wildcard": false,
+      "authorized": true,
+      "effective_owner": "example.com",
+      "trace": [
+        {"query": "example.com", "kind": "caa", "cname_target": null, "cname_hops": 0,
+         "caa": [{"flag": 0, "tag": "issue", "value": "letsencrypt.org"}]}
+      ]
+    }
+  ]
+}
+```
+
+若把 `ca` 换成 `pki.goog`，两个标识都未获授权，响应为 `accepted=false`（HTTP 200），
+各标识的 `authorized` 均为 `false`。
+
 ### `POST /v1/records/import-zone`
 
 把一段 BIND zone 文本解析成**可直接作为 `/v1/authorize` 的 `records` 使用**的 CAA/CNAME
@@ -657,7 +761,8 @@ curl -s -X POST http://localhost:8080/v1/records/minimize \
   `evaluate_prepared(domain, wildcard, ca, prepare_records(records))`，
   供 `/v1/authorize` 等单查询入口使用。
 
-批量操作（`/v1/issuance/route` 容量分配、`/v1/authorize/patch-plan` 补丁规划、
+批量操作（`/v1/issuance/route` 容量分配、`/v1/issuance/check-csr` CSR 受理、
+`/v1/authorize/patch-plan` 补丁规划、
 `/v1/authorize/change-impact` 变更影响、`/v1/records/minimize` 记录精简、
 `/v1/authorize/rollout-window` 灰度窗口）在单次操作中对每个基线、新版或候选记录组
 **至多准备一次**，该组的全部查询复用同一快照；搜索再次访问同一记录组时
@@ -766,12 +871,14 @@ app/
   __init__.py
   engine.py     # 记录准备（prepare_records → 不可变索引）与查询判定（evaluate_prepared）分离；
               # 规范化、逐级上溯、CNAME 链、判定规则（纯逻辑，无 I/O）
+  csr.py        # PKCS#10 CSR 受理：PEM 解析、自签名校验、SAN DNS 标识提取与逐标识授权
   zonefile.py   # BIND zone 文本解析与导出（$ORIGIN/$TTL、owner 继承、括号/引号/转义）
   schemas.py    # Pydantic v2 请求/响应模型与输入校验
   main.py       # FastAPI 路由与 422 异常映射
 tests/
   test_api.py             # 48 条 authorize / patch-plan 端到端用例
   test_change_impact.py   # 28 条变更影响审查（change-impact）用例
+  test_check_csr.py       # 36 条 CSR 受理（check-csr）用例
   test_export_zone.py     # 26 条 zone 导出（export-zone）用例
   test_issuance_route.py  # 24 条批量签发路由用例（pytest + TestClient）
   test_import_zone.py     # 45 条 zone 导入用例

@@ -1,13 +1,14 @@
 """FastAPI application exposing POST /v1/authorize, /v1/authorize/patch-plan,
 /v1/authorize/change-impact, /v1/authorize/rollout-window,
-/v1/issuance/route, /v1/records/import-zone, /v1/records/export-zone and
-/v1/records/minimize."""
+/v1/issuance/route, /v1/issuance/check-csr, /v1/records/import-zone,
+/v1/records/export-zone and /v1/records/minimize."""
 
 from __future__ import annotations
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from .csr import check_csr
 from .engine import (
     CAAError,
     change_impact,
@@ -22,6 +23,8 @@ from .schemas import (
     AuthorizeResponse,
     ChangeImpactRequest,
     ChangeImpactResponse,
+    CheckCSRRequest,
+    CheckCSRResponse,
     ExportZoneRequest,
     ExportZoneResponse,
     ImportZoneRequest,
@@ -150,6 +153,21 @@ async def issuance_route(payload: IssuanceRouteRequest) -> IssuanceRouteResponse
         records=[r.model_dump() for r in payload.records],
     )
     return IssuanceRouteResponse(**result)
+
+
+@app.post(
+    "/v1/issuance/check-csr",
+    response_model=CheckCSRResponse,
+    tags=["caa"],
+    summary="Verify a CSR and authorize every SAN DNS identifier",
+)
+async def issuance_check_csr(payload: CheckCSRRequest) -> CheckCSRResponse:
+    result = check_csr(
+        csr_pem=payload.csr,
+        ca=payload.ca,
+        records=[r.model_dump() for r in payload.records],
+    )
+    return CheckCSRResponse(**result)
 
 
 @app.post(
